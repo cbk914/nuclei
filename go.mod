@@ -9,7 +9,7 @@ require (
 	github.com/d5/tengo/v2 v2.6.2
 	github.com/google/go-github/v32 v32.1.0
 	github.com/json-iterator/go v1.1.10
-	github.com/karrick/godirwalk v1.15.6
+	github.com/karrick/godirwalk v1.16.1
 	github.com/logrusorgru/aurora v2.0.3+incompatible
 	github.com/miekg/dns v1.1.31
 	github.com/pkg/errors v0.9.1
