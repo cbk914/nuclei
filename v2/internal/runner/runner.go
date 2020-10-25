@@ -2,41 +2,46 @@ package runner
 
 import (
 	"bufio"
-	"context"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"os"
 	"regexp"
 	"strings"
-	"sync"
-	"time"
-
-	"golang.org/x/time/rate"
 
 	"github.com/logrusorgru/aurora"
+	"github.com/pkg/errors"
 	"github.com/projectdiscovery/gologger"
+	"github.com/projectdiscovery/httpx/common/cache"
 	"github.com/projectdiscovery/nuclei/v2/internal/bufwriter"
 	"github.com/projectdiscovery/nuclei/v2/internal/progress"
+	"github.com/projectdiscovery/nuclei/v2/internal/tracelog"
 	"github.com/projectdiscovery/nuclei/v2/pkg/atomicboolean"
+	"github.com/projectdiscovery/nuclei/v2/pkg/collaborator"
 	"github.com/projectdiscovery/nuclei/v2/pkg/colorizer"
+	"github.com/projectdiscovery/nuclei/v2/pkg/globalratelimiter"
+	"github.com/projectdiscovery/nuclei/v2/pkg/projectfile"
 	"github.com/projectdiscovery/nuclei/v2/pkg/templates"
 	"github.com/projectdiscovery/nuclei/v2/pkg/workflows"
+	"github.com/remeh/sizedwaitgroup"
 )
 
 // Runner is a client for running the enumeration process.
 type Runner struct {
 	input      string
 	inputCount int64
+	tempFile   string
+
+	traceLog tracelog.Log
 
 	// output is the output file to write if any
 	output *bufwriter.Writer
 
-	tempFile        string
 	templatesConfig *nucleiConfig
 	// options contains configuration options for runner
 	options *Options
-	limiter chan struct{}
+
+	pf *projectfile.ProjectFile
 
 	// progress tracking
 	progress progress.IProgress
@@ -44,12 +49,23 @@ type Runner struct {
 	// output coloring
 	colorizer   colorizer.NucleiColorizer
 	decolorizer *regexp.Regexp
+
+	// http dialer
+	dialer cache.DialerFunc
 }
 
 // New creates a new client for running enumeration process.
 func New(options *Options) (*Runner, error) {
 	runner := &Runner{
-		options: options,
+		traceLog: &tracelog.NoopLogger{},
+		options:  options,
+	}
+	if options.TraceLogFile != "" {
+		fileLog, err := tracelog.NewFileLogger(options.TraceLogFile)
+		if err != nil {
+			return nil, errors.Wrap(err, "could not create file trace logger")
+		}
+		runner.traceLog = fileLog
 	}
 
 	if err := runner.updateTemplates(); err != nil {
@@ -121,7 +137,7 @@ func New(options *Options) (*Runner, error) {
 	}
 
 	// Sanitize input and pre-compute total number of targets
-	var usedInput = make(map[string]bool)
+	var usedInput = make(map[string]struct{})
 
 	dupeCount := 0
 	sb := strings.Builder{}
@@ -136,8 +152,11 @@ func New(options *Options) (*Runner, error) {
 		}
 		// deduplication
 		if _, ok := usedInput[url]; !ok {
-			usedInput[url] = true
+			usedInput[url] = struct{}{}
 			runner.inputCount++
+
+			// allocate global rate limiters
+			globalratelimiter.Add(url, options.RateLimit)
 
 			sb.WriteString(url)
 			sb.WriteString("\n")
@@ -165,7 +184,25 @@ func New(options *Options) (*Runner, error) {
 	// Creates the progress tracking object
 	runner.progress = progress.NewProgress(runner.colorizer.Colorizer, options.EnableProgressBar)
 
-	runner.limiter = make(chan struct{}, options.Threads)
+	// create project file if requested or load existing one
+	if options.Project {
+		var err error
+		runner.pf, err = projectfile.New(&projectfile.Options{Path: options.ProjectPath, Cleanup: options.ProjectPath == ""})
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// Enable Polling
+	if options.BurpCollaboratorBiid != "" {
+		collaborator.DefaultCollaborator.Collab.AddBIID(options.BurpCollaboratorBiid)
+	}
+
+	// Create Dialer
+	runner.dialer, err = cache.NewDialer(cache.DefaultOptions)
+	if err != nil {
+		return nil, err
+	}
 
 	return runner, nil
 }
@@ -176,6 +213,9 @@ func (r *Runner) Close() {
 		r.output.Close()
 	}
 	os.Remove(r.tempFile)
+	if r.pf != nil {
+		r.pf.Close()
+	}
 }
 
 // RunEnumeration sets up the input layer for giving input nuclei.
@@ -232,36 +272,29 @@ func (r *Runner) RunEnumeration() {
 		} // nolint:wsl // comment
 	}
 
-	var (
-		wgtemplates sync.WaitGroup
-		results     atomicboolean.AtomBool
-	)
+	results := atomicboolean.New()
+	wgtemplates := sizedwaitgroup.New(r.options.TemplateThreads)
+	// Starts polling or ignore
+	collaborator.DefaultCollaborator.Poll()
 
 	if r.inputCount == 0 {
 		gologger.Errorf("Could not find any valid input URLs.")
 	} else if totalRequests > 0 || hasWorkflows {
-		ctx := context.Background()
-		// Limiter that will add to the tokenbucket every second and set the max size to -rl flag
-		rateLimit := rate.NewLimiter(rate.Every(1*time.Second), r.options.RateLimit)
 		// tracks global progress and captures stdout/stderr until p.Wait finishes
 		p := r.progress
 		p.InitProgressbar(r.inputCount, templateCount, totalRequests)
 
 		for _, t := range availableTemplates {
-			wgtemplates.Add(1)
+			wgtemplates.Add()
 			go func(template interface{}) {
 				defer wgtemplates.Done()
-				err := rateLimit.Wait(ctx)
-				if err != nil {
-					gologger.Errorf("Issue with rate-limit")
-				}
 				switch tt := template.(type) {
 				case *templates.Template:
 					for _, request := range tt.RequestsDNS {
-						results.Or(r.processTemplateWithList(ctx, p, tt, request))
+						results.Or(r.processTemplateWithList(p, tt, request))
 					}
 					for _, request := range tt.BulkRequestsHTTP {
-						results.Or(r.processTemplateWithList(ctx, p, tt, request))
+						results.Or(r.processTemplateWithList(p, tt, request))
 					}
 				case *workflows.Workflow:
 					results.Or(r.processWorkflowWithList(p, template.(*workflows.Workflow)))

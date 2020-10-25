@@ -4,17 +4,21 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"net"
 	"net/http"
 	"net/url"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/Knetic/govaluate"
 	"github.com/projectdiscovery/nuclei/v2/pkg/extractors"
 	"github.com/projectdiscovery/nuclei/v2/pkg/generators"
 	"github.com/projectdiscovery/nuclei/v2/pkg/matchers"
+	"github.com/projectdiscovery/nuclei/v2/pkg/syncedreadcloser"
+	"github.com/projectdiscovery/rawhttp"
 	retryablehttp "github.com/projectdiscovery/retryablehttp-go"
 )
 
@@ -24,46 +28,63 @@ const (
 )
 
 var urlWithPortRgx = regexp.MustCompile(`{{BaseURL}}:(\d+)`)
-var urlWithPathRgx = regexp.MustCompile(`{{BaseURL}}.*/`)
 
 // BulkHTTPRequest contains a request to be made from a template
 type BulkHTTPRequest struct {
-	// CookieReuse is an optional setting that makes cookies shared within requests
-	CookieReuse bool `yaml:"cookie-reuse,omitempty"`
-	// Redirects specifies whether redirects should be followed.
-	Redirects bool   `yaml:"redirects,omitempty"`
-	Name      string `yaml:"Name,omitempty"`
+	// Path contains the path/s for the request
+	Path []string `yaml:"path"`
+	// Matchers contains the detection mechanism for the request to identify
+	// whether the request was successful
+	Matchers []*matchers.Matcher `yaml:"matchers,omitempty"`
+	// Extractors contains the extraction mechanism for the request to identify
+	// and extract parts of the response.
+	Extractors []*extractors.Extractor `yaml:"extractors,omitempty"`
+	// Raw contains raw requests
+	Raw  []string `yaml:"raw,omitempty"`
+	Name string   `yaml:"Name,omitempty"`
 	// AttackType is the attack type
 	// Sniper, PitchFork and ClusterBomb. Default is Sniper
 	AttackType string `yaml:"attack,omitempty"`
+	// Method is the request method, whether GET, POST, PUT, etc
+	Method string `yaml:"method"`
+	// Body is an optional parameter which contains the request body for POST methods, etc
+	Body string `yaml:"body,omitempty"`
+	// MatchersCondition is the condition of the matchers
+	// whether to use AND or OR. Default is OR.
+	MatchersCondition string `yaml:"matchers-condition,omitempty"`
 	// attackType is internal attack type
 	attackType generators.Type
 	// Path contains the path/s for the request variables
 	Payloads map[string]interface{} `yaml:"payloads,omitempty"`
-	// Method is the request method, whether GET, POST, PUT, etc
-	Method string `yaml:"method"`
-	// Path contains the path/s for the request
-	Path []string `yaml:"path"`
 	// Headers contains headers to send with the request
 	Headers map[string]string `yaml:"headers,omitempty"`
-	// Body is an optional parameter which contains the request body for POST methods, etc
-	Body string `yaml:"body,omitempty"`
-	// Matchers contains the detection mechanism for the request to identify
-	// whether the request was successful
-	Matchers []*matchers.Matcher `yaml:"matchers,omitempty"`
-	// MatchersCondition is the condition of the matchers
-	// whether to use AND or OR. Default is OR.
-	MatchersCondition string `yaml:"matchers-condition,omitempty"`
 	// matchersCondition is internal condition for the matchers.
 	matchersCondition matchers.ConditionType
-	// Extractors contains the extraction mechanism for the request to identify
-	// and extract parts of the response.
-	Extractors []*extractors.Extractor `yaml:"extractors,omitempty"`
 	// MaxRedirects is the maximum number of redirects that should be followed.
-	MaxRedirects int `yaml:"max-redirects,omitempty"`
-	// Raw contains raw requests
-	Raw  []string `yaml:"raw,omitempty"`
+	MaxRedirects                  int `yaml:"max-redirects,omitempty"`
+	PipelineConcurrentConnections int `yaml:"pipeline-concurrent-connections,omitempty"`
+	PipelineRequestsPerConnection int `yaml:"pipeline-requests-per-connection,omitempty"`
+	Threads                       int `yaml:"threads,omitempty"`
+	// Internal Finite State Machine keeping track of scan process
 	gsfm *GeneratorFSM
+	// CookieReuse is an optional setting that makes cookies shared within requests
+	CookieReuse bool `yaml:"cookie-reuse,omitempty"`
+	// Redirects specifies whether redirects should be followed.
+	Redirects bool `yaml:"redirects,omitempty"`
+	// Pipeline defines if the attack should be performed with HTTP 1.1 Pipelining (race conditions/billions requests)
+	// All requests must be indempotent (GET/POST)
+	Pipeline bool `yaml:"pipeline,omitempty"`
+	// Specify in order to skip request RFC normalization
+	Unsafe bool `yaml:"unsafe,omitempty"`
+	// DisableAutoHostname Enable/Disable Host header for unsafe raw requests
+	DisableAutoHostname bool `yaml:"disable-automatic-host-header,omitempty"`
+	// DisableAutoContentLength Enable/Disable Content-Length header for unsafe raw requests
+	DisableAutoContentLength bool `yaml:"disable-automatic-content-length-header,omitempty"`
+	// Race determines if all the request have to be attempted at the same time
+	// The minimum number fof requests is determined by threads
+	Race bool `yaml:"race,omitempty"`
+	// Number of same request to send in race condition attack
+	RaceNumberRequests int `yaml:"race_count,omitempty"`
 }
 
 // GetMatchersCondition returns the condition for the matcher
@@ -88,11 +109,13 @@ func (r *BulkHTTPRequest) SetAttackType(attack generators.Type) {
 
 // GetRequestCount returns the total number of requests the YAML rule will perform
 func (r *BulkHTTPRequest) GetRequestCount() int64 {
-	return int64(len(r.Raw) | len(r.Path))
+	return int64(r.gsfm.Total())
 }
 
 // MakeHTTPRequest makes the HTTP request
-func (r *BulkHTTPRequest) MakeHTTPRequest(ctx context.Context, baseURL string, dynamicValues map[string]interface{}, data string) (*HTTPRequest, error) {
+func (r *BulkHTTPRequest) MakeHTTPRequest(baseURL string, dynamicValues map[string]interface{}, data string) (*HTTPRequest, error) {
+	ctx := context.Background()
+
 	parsed, err := url.Parse(baseURL)
 	if err != nil {
 		return nil, err
@@ -201,18 +224,40 @@ func (r *BulkHTTPRequest) handleRawWithPaylods(ctx context.Context, raw, baseURL
 	dynamicReplacer := newReplacer(dynamicValues)
 	raw = dynamicReplacer.Replace(raw)
 
-	compiledRequest, err := r.parseRawRequest(raw, baseURL)
+	rawRequest, err := r.parseRawRequest(raw, baseURL)
 	if err != nil {
 		return nil, err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, compiledRequest.Method, compiledRequest.FullURL, strings.NewReader(compiledRequest.Data))
+	// rawhttp
+	if r.Unsafe {
+		unsafeReq := &HTTPRequest{
+			RawRequest:                   rawRequest,
+			Meta:                         genValues,
+			AutomaticHostHeader:          !r.DisableAutoHostname,
+			AutomaticContentLengthHeader: !r.DisableAutoContentLength,
+			Unsafe:                       true,
+			FollowRedirects:              r.Redirects,
+		}
+		return unsafeReq, nil
+	}
+
+	// retryablehttp
+	var body io.ReadCloser
+	body = ioutil.NopCloser(strings.NewReader(rawRequest.Data))
+	if r.Race {
+		// More or less this ensures that all requests hit the endpoint at the same approximated time
+		// Todo: sync internally upon writing latest request byte
+		body = syncedreadcloser.NewOpenGateWithTimeout(body, time.Duration(two)*time.Second)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, rawRequest.Method, rawRequest.FullURL, body)
 	if err != nil {
 		return nil, err
 	}
 
 	// copy headers
-	for key, value := range compiledRequest.Headers {
+	for key, value := range rawRequest.Headers {
 		req.Header[key] = []string{value}
 	}
 
@@ -225,18 +270,21 @@ func (r *BulkHTTPRequest) handleRawWithPaylods(ctx context.Context, raw, baseURL
 }
 
 func (r *BulkHTTPRequest) fillRequest(req *http.Request, values map[string]interface{}) (*retryablehttp.Request, error) {
-	setHeader(req, "Connection", "close")
-	req.Close = true
 	replacer := newReplacer(values)
+	// Set the header values requested
+	for header, value := range r.Headers {
+		req.Header[header] = []string{replacer.Replace(value)}
+	}
+
+	// In case of multiple threads the underlying connection should remain open to allow reuse
+	if r.Threads <= 0 && req.Header.Get("Connection") == "" {
+		setHeader(req, "Connection", "close")
+		req.Close = true
+	}
 
 	// Check if the user requested a request body
 	if r.Body != "" {
 		req.Body = ioutil.NopCloser(strings.NewReader(r.Body))
-	}
-
-	// Set the header values requested
-	for header, value := range r.Headers {
-		req.Header[header] = []string{replacer.Replace(value)}
 	}
 
 	setHeader(req, "User-Agent", "Nuclei - Open-source project (github.com/projectdiscovery/nuclei)")
@@ -254,8 +302,20 @@ func (r *BulkHTTPRequest) fillRequest(req *http.Request, values map[string]inter
 
 // HTTPRequest is the basic HTTP request
 type HTTPRequest struct {
-	Request *retryablehttp.Request
-	Meta    map[string]interface{}
+	Request    *retryablehttp.Request
+	RawRequest *RawRequest
+	Meta       map[string]interface{}
+
+	// flags
+	Unsafe                       bool
+	Pipeline                     bool
+	AutomaticHostHeader          bool
+	AutomaticContentLengthHeader bool
+	AutomaticConnectionHeader    bool
+	FollowRedirects              bool
+	Rawclient                    *rawhttp.Client
+	Httpclient                   *retryablehttp.Client
+	PipelineClient               *rawhttp.PipelineClient
 }
 
 func setHeader(req *http.Request, name, value string) {
@@ -269,16 +329,13 @@ func setHeader(req *http.Request, name, value string) {
 // the template port and path preference
 func baseURLWithTemplatePrefs(data string, parsedURL *url.URL) string {
 	// template port preference over input URL port
+	// template has port
 	hasPort := len(urlWithPortRgx.FindStringSubmatch(data)) > 0
 	if hasPort {
-		hostname, _, _ := net.SplitHostPort(parsedURL.Host)
-		parsedURL.Host = hostname
-	}
-
-	// template path preference over input URL path
-	hasPath := len(urlWithPathRgx.FindStringSubmatch(data)) > 0
-	if hasPath {
-		parsedURL.Path = ""
+		// check if also the input contains port, in this case extracts the url
+		if hostname, _, err := net.SplitHostPort(parsedURL.Host); err == nil {
+			parsedURL.Host = hostname
+		}
 	}
 
 	return parsedURL.String()
@@ -328,6 +385,8 @@ func (r *BulkHTTPRequest) parseRawRequest(request, baseURL string) (*RawRequest,
 	// Set the request Method
 	rawRequest.Method = parts[0]
 
+	// Accepts all malformed headers
+	var key, value string
 	for {
 		line, readErr := reader.ReadString('\n')
 		line = strings.TrimSpace(line)
@@ -337,20 +396,17 @@ func (r *BulkHTTPRequest) parseRawRequest(request, baseURL string) (*RawRequest,
 		}
 
 		p := strings.SplitN(line, ":", two)
-		if len(p) != two {
-			continue
+		key = p[0]
+		if len(p) > 1 {
+			value = p[1]
 		}
 
-		if strings.EqualFold(p[0], "content-length") {
-			continue
-		}
-
-		rawRequest.Headers[strings.TrimSpace(p[0])] = strings.TrimSpace(p[1])
+		rawRequest.Headers[key] = value
 	}
 
 	// Handle case with the full http url in path. In that case,
 	// ignore any host header that we encounter and use the path as request URL
-	if strings.HasPrefix(parts[1], "http") {
+	if !r.Unsafe && strings.HasPrefix(parts[1], "http") {
 		parsed, parseErr := url.Parse(parts[1])
 		if parseErr != nil {
 			return nil, fmt.Errorf("could not parse request URL: %s", parseErr)
@@ -385,7 +441,7 @@ func (r *BulkHTTPRequest) parseRawRequest(request, baseURL string) (*RawRequest,
 		rawRequest.Path = fmt.Sprintf("%s%s", parsedURL.Path, rawRequest.Path)
 	}
 
-	rawRequest.FullURL = fmt.Sprintf("%s://%s%s", parsedURL.Scheme, hostURL, rawRequest.Path)
+	rawRequest.FullURL = fmt.Sprintf("%s://%s%s", parsedURL.Scheme, strings.TrimSpace(hostURL), rawRequest.Path)
 
 	// Set the request body
 	b, err := ioutil.ReadAll(reader)
@@ -420,7 +476,7 @@ func (r *BulkHTTPRequest) Current(reqURL string) string {
 
 // Total is the total number of requests
 func (r *BulkHTTPRequest) Total() int {
-	return len(r.Path) + len(r.Raw)
+	return r.gsfm.Total()
 }
 
 // Increment increments the processed request

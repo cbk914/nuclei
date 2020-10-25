@@ -9,7 +9,6 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
-	"sync"
 
 	tengo "github.com/d5/tengo/v2"
 	"github.com/d5/tengo/v2/stdlib"
@@ -21,6 +20,7 @@ import (
 	"github.com/projectdiscovery/nuclei/v2/pkg/requests"
 	"github.com/projectdiscovery/nuclei/v2/pkg/templates"
 	"github.com/projectdiscovery/nuclei/v2/pkg/workflows"
+	"github.com/remeh/sizedwaitgroup"
 )
 
 // workflowTemplates contains the initialized workflow templates per template group
@@ -30,7 +30,7 @@ type workflowTemplates struct {
 }
 
 // processTemplateWithList processes a template and runs the enumeration on all the targets
-func (r *Runner) processTemplateWithList(ctx context.Context, p progress.IProgress, template *templates.Template, request interface{}) bool {
+func (r *Runner) processTemplateWithList(p progress.IProgress, template *templates.Template, request interface{}) bool {
 	var httpExecuter *executer.HTTPExecuter
 	var dnsExecuter *executer.DNSExecuter
 	var err error
@@ -39,33 +39,40 @@ func (r *Runner) processTemplateWithList(ctx context.Context, p progress.IProgre
 	switch value := request.(type) {
 	case *requests.DNSRequest:
 		dnsExecuter = executer.NewDNSExecuter(&executer.DNSOptions{
+			TraceLog:      r.traceLog,
 			Debug:         r.options.Debug,
 			Template:      template,
 			DNSRequest:    value,
 			Writer:        r.output,
 			JSON:          r.options.JSON,
 			JSONRequests:  r.options.JSONRequests,
+			NoMeta:        r.options.NoMeta,
 			ColoredOutput: !r.options.NoColor,
 			Colorizer:     r.colorizer,
 			Decolorizer:   r.decolorizer,
 		})
 	case *requests.BulkHTTPRequest:
 		httpExecuter, err = executer.NewHTTPExecuter(&executer.HTTPOptions{
-			Debug:           r.options.Debug,
-			Template:        template,
-			BulkHTTPRequest: value,
-			Writer:          r.output,
-			Timeout:         r.options.Timeout,
-			Retries:         r.options.Retries,
-			ProxyURL:        r.options.ProxyURL,
-			ProxySocksURL:   r.options.ProxySocksURL,
-			CustomHeaders:   r.options.CustomHeaders,
-			JSON:            r.options.JSON,
-			JSONRequests:    r.options.JSONRequests,
-			CookieReuse:     value.CookieReuse,
-			ColoredOutput:   !r.options.NoColor,
-			Colorizer:       &r.colorizer,
-			Decolorizer:     r.decolorizer,
+			TraceLog:         r.traceLog,
+			Debug:            r.options.Debug,
+			Template:         template,
+			BulkHTTPRequest:  value,
+			Writer:           r.output,
+			Timeout:          r.options.Timeout,
+			Retries:          r.options.Retries,
+			ProxyURL:         r.options.ProxyURL,
+			ProxySocksURL:    r.options.ProxySocksURL,
+			CustomHeaders:    r.options.CustomHeaders,
+			JSON:             r.options.JSON,
+			JSONRequests:     r.options.JSONRequests,
+			NoMeta:           r.options.NoMeta,
+			CookieReuse:      value.CookieReuse,
+			ColoredOutput:    !r.options.NoColor,
+			Colorizer:        &r.colorizer,
+			Decolorizer:      r.decolorizer,
+			StopAtFirstMatch: r.options.StopAtFirstMatch,
+			PF:               r.pf,
+			Dialer:           &r.dialer,
 		})
 	}
 
@@ -78,23 +85,19 @@ func (r *Runner) processTemplateWithList(ctx context.Context, p progress.IProgre
 
 	var globalresult atomicboolean.AtomBool
 
-	var wg sync.WaitGroup
+	wg := sizedwaitgroup.New(r.options.BulkSize)
 
 	scanner := bufio.NewScanner(strings.NewReader(r.input))
 	for scanner.Scan() {
-		text := scanner.Text()
-
-		r.limiter <- struct{}{}
-
-		wg.Add(1)
-
+		URL := scanner.Text()
+		wg.Add()
 		go func(URL string) {
 			defer wg.Done()
 
-			var result executer.Result
+			var result *executer.Result
 
 			if httpExecuter != nil {
-				result = httpExecuter.ExecuteHTTP(ctx, p, URL)
+				result = httpExecuter.ExecuteHTTP(p, URL)
 				globalresult.Or(result.GotResults)
 			}
 
@@ -106,9 +109,7 @@ func (r *Runner) processTemplateWithList(ctx context.Context, p progress.IProgre
 			if result.Error != nil {
 				gologger.Warningf("[%s] Could not execute step: %s\n", r.colorizer.Colorizer.BrightBlue(template.ID), result.Error)
 			}
-
-			<-r.limiter
-		}(text)
+		}(URL)
 	}
 
 	wg.Wait()
@@ -130,14 +131,12 @@ func (r *Runner) processWorkflowWithList(p progress.IProgress, workflow *workflo
 
 	logicBytes := []byte(workflow.Logic)
 
-	var wg sync.WaitGroup
+	wg := sizedwaitgroup.New(r.options.BulkSize)
 
 	scanner := bufio.NewScanner(strings.NewReader(r.input))
 	for scanner.Scan() {
 		targetURL := scanner.Text()
-		r.limiter <- struct{}{}
-
-		wg.Add(1)
+		wg.Add()
 
 		go func(targetURL string) {
 			defer wg.Done()
@@ -170,8 +169,6 @@ func (r *Runner) processWorkflowWithList(p progress.IProgress, workflow *workflo
 					break
 				}
 			}
-
-			<-r.limiter
 		}(targetURL)
 	}
 
@@ -221,6 +218,7 @@ func (r *Runner) preloadWorkflowTemplates(p progress.IProgress, workflow *workfl
 			template := &workflows.Template{Progress: p}
 			if len(t.BulkRequestsHTTP) > 0 {
 				template.HTTPOptions = &executer.HTTPOptions{
+					TraceLog:      r.traceLog,
 					Debug:         r.options.Debug,
 					Writer:        r.output,
 					Template:      t,
@@ -235,9 +233,11 @@ func (r *Runner) preloadWorkflowTemplates(p progress.IProgress, workflow *workfl
 					ColoredOutput: !r.options.NoColor,
 					Colorizer:     &r.colorizer,
 					Decolorizer:   r.decolorizer,
+					PF:            r.pf,
 				}
 			} else if len(t.RequestsDNS) > 0 {
 				template.DNSOptions = &executer.DNSOptions{
+					TraceLog:      r.traceLog,
 					Debug:         r.options.Debug,
 					Template:      t,
 					Writer:        r.output,

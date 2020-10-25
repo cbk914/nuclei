@@ -9,6 +9,7 @@ import (
 	"github.com/projectdiscovery/gologger"
 	"github.com/projectdiscovery/nuclei/v2/internal/bufwriter"
 	"github.com/projectdiscovery/nuclei/v2/internal/progress"
+	"github.com/projectdiscovery/nuclei/v2/internal/tracelog"
 	"github.com/projectdiscovery/nuclei/v2/pkg/colorizer"
 	"github.com/projectdiscovery/nuclei/v2/pkg/matchers"
 	"github.com/projectdiscovery/nuclei/v2/pkg/requests"
@@ -19,11 +20,14 @@ import (
 // DNSExecuter is a client for performing a DNS request
 // for a template.
 type DNSExecuter struct {
+	// hm            *hybrid.HybridMap // Unused
 	coloredOutput bool
 	debug         bool
 	jsonOutput    bool
 	jsonRequest   bool
+	noMeta        bool
 	Results       bool
+	traceLog      tracelog.Log
 	dnsClient     *retryabledns.Client
 	template      *templates.Template
 	dnsRequest    *requests.DNSRequest
@@ -47,6 +51,8 @@ type DNSOptions struct {
 	Debug         bool
 	JSON          bool
 	JSONRequests  bool
+	NoMeta        bool
+	TraceLog      tracelog.Log
 	Template      *templates.Template
 	DNSRequest    *requests.DNSRequest
 	Writer        *bufwriter.Writer
@@ -62,7 +68,9 @@ func NewDNSExecuter(options *DNSOptions) *DNSExecuter {
 
 	executer := &DNSExecuter{
 		debug:         options.Debug,
+		noMeta:        options.NoMeta,
 		jsonOutput:    options.JSON,
+		traceLog:      options.TraceLog,
 		jsonRequest:   options.JSONRequests,
 		dnsClient:     dnsClient,
 		template:      options.Template,
@@ -77,7 +85,9 @@ func NewDNSExecuter(options *DNSOptions) *DNSExecuter {
 }
 
 // ExecuteDNS executes the DNS request on a URL
-func (e *DNSExecuter) ExecuteDNS(p progress.IProgress, reqURL string) (result Result) {
+func (e *DNSExecuter) ExecuteDNS(p progress.IProgress, reqURL string) *Result {
+	result := &Result{}
+
 	// Parse the URL and return domain if URL.
 	var domain string
 	if isURL(reqURL) {
@@ -89,12 +99,14 @@ func (e *DNSExecuter) ExecuteDNS(p progress.IProgress, reqURL string) (result Re
 	// Compile each request for the template based on the URL
 	compiledRequest, err := e.dnsRequest.MakeDNSRequest(domain)
 	if err != nil {
+		e.traceLog.Request(e.template.ID, domain, "dns", err)
 		result.Error = errors.Wrap(err, "could not make dns request")
 
 		p.Drop(1)
 
-		return
+		return result
 	}
+	e.traceLog.Request(e.template.ID, domain, "dns", nil)
 
 	if e.debug {
 		gologger.Infof("Dumped DNS request for %s (%s)\n\n", reqURL, e.template.ID)
@@ -108,7 +120,7 @@ func (e *DNSExecuter) ExecuteDNS(p progress.IProgress, reqURL string) (result Re
 
 		p.Drop(1)
 
-		return
+		return result
 	}
 
 	p.Update()
@@ -127,7 +139,7 @@ func (e *DNSExecuter) ExecuteDNS(p progress.IProgress, reqURL string) (result Re
 		if !matcher.MatchDNS(resp) {
 			// If the condition is AND we haven't matched, return.
 			if matcherCondition == matchers.ANDCondition {
-				return
+				return result
 			}
 		} else {
 			// If the matcher has matched, and its an OR
